@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="UTF-8">
+    <title>PDF 서명 로직 검증 테스트</title>
+    <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .test-case {
+            border: 1px solid #ccc;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+
+        .success {
+            color: green;
+            font-weight: bold;
+        }
+
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+
+        pre {
+            background: #f4f4f4;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+
+        .loading {
+            color: #666;
+            font-style: italic;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        th,
+        td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+
+        th {
+            background: #f8f9fa;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>PDF 서명 로직 검증 테스트</h1>
+    <p>프로젝트 내 <code>samples/</code> 폴더의 파일을 사용하여 양식 감지 및 좌표 계산을 검증합니다.</p>
+
+    <div id="results">
+        <div class="loading">테스트가 곧 시작됩니다...</div>
+    </div>
+
+    <!-- 실제 서비스 로직과 동일한 기능을 수행하기 위해 app.js의 주요 함수를 인출합니다. -->
+    <script>
+        const pdfjsLib = window['pdfjs-dist/build/pdf'];
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        // app.js에서 검증할 핵심 엔진 추출 (정상 작동 확인용)
+        async function findAgentAnchor(pdfBytes) {
+            const doc = await pdfjsLib.getDocument({ data: new Uint8Array(pdfBytes) }).promise;
+
+            let docType = '장기';
+            const firstPage = await doc.getPage(1);
+            const firstPageContent = await firstPage.getTextContent();
+            const fullSpecText = firstPageContent.items.map((it) => it.str).join(' ');
+
+            if (fullSpecText.includes('자동차보험상품')) {
+                docType = '자동차';
+            } else if (fullSpecText.includes('일반보험상품')) {
+                docType = '일반';
+            } else if (fullSpecText.includes('보험상품')) {
+                docType = '장기';
+            }
+
+            const anchorKeyword = docType === '장기' ? '보험모집인' : '설계사';
+
+            for (let pageNo = 1; pageNo <= doc.numPages; pageNo += 1) {
+                const page = await doc.getPage(pageNo);
+                const textContent = await page.getTextContent();
+                const items = textContent.items;
+
+                const baseItems = items.filter((item) => String(item.str || '').includes(anchorKeyword));
+
+                for (const baseItem of baseItems) {
+                    const baseY = baseItem.transform[5];
+                    const baseX = baseItem.transform[4];
+
+                    const signTargets = items.filter((item) => {
+                        const itemY = item.transform[5];
+                        const itemX = item.transform[4];
+                        return Math.abs(itemY - baseY) < 5 && itemX >= baseX;
+                    });
+
+                    for (const item of signTargets) {
+                        const fullText = String(item.str || '');
+                        const cleanText = fullText.replace(/\s+/g, '');
+                        if (cleanText.includes('(서명/인)') || cleanText.includes('서명/인') || cleanText.endsWith('인)')) {
+                            let x = item.transform[4];
+                            let width = item.width || 40;
+
+                            const signPartIdx = fullText.indexOf('(');
+                            if (signPartIdx > 0) {
+                                const ratio = signPartIdx / fullText.length;
+                                x += width * ratio;
+                                width = width * (1 - ratio);
+                            }
+
+                            return {
+                                pageIndex: pageNo - 1,
+                                x: x,
+                                y: item.transform[5],
+                                width: width,
+                                text: fullText,
+                                docType,
+                            };
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+
+        const testCases = [
+            { name: "1. 장기보험 양식", path: "samples/1_long_term.pdf", expectedType: "장기" },
+            { name: "2. 일반보험 양식", path: "samples/2_general.pdf", expectedType: "일반" },
+            { name: "3. 자동차보험 양식", path: "samples/3_auto.pdf", expectedType: "자동차" }
+        ];
+
+        async function runTests() {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '';
+
+            for (const testCase of testCases) {
+                const caseDiv = document.createElement('div');
+                caseDiv.className = 'test-case';
+                caseDiv.innerHTML = `<h3>${testCase.name}</h3><p class="loading">분석 중: ${testCase.path}...</p>`;
+                resultsDiv.appendChild(caseDiv);
+
+                try {
+                    const response = await fetch(testCase.path);
+                    if (!response.ok) throw new Error(`파일을 불러올 수 없습니다: ${response.statusText}`);
+                    const arrayBuffer = await response.arrayBuffer();
+
+                    const startTime = performance.now();
+                    const anchor = await findAgentAnchor(arrayBuffer);
+                    const endTime = performance.now();
+
+                    if (anchor) {
+                        const typeMatch = anchor.docType === testCase.expectedType;
+                        caseDiv.innerHTML = `
+                            <h3>${testCase.name} ${typeMatch ? '<span class="success">[PASS]</span>' : '<span class="error">[FAIL - Type Mismatch]</span>'}</h3>
+                            <table>
+                                <tr><th>항목</th><th>결과</th></tr>
+                                <tr><td>감지된 양식</td><td>${anchor.docType} (기대: ${testCase.expectedType})</td></tr>
+                                <tr><td>페이지 번호</td><td>${anchor.pageIndex + 1} 페이지</td></tr>
+                                <tr><td>X 좌표</td><td>${anchor.x.toFixed(2)}</td></tr>
+                                <tr><td>Y 좌표</td><td>${anchor.y.toFixed(2)}</td></tr>
+                                <tr><td>문구 너비</td><td>${anchor.width.toFixed(2)}</td></tr>
+                                <tr><td>탐색된 문구</td><td><code>${anchor.text}</code></td></tr>
+                                <tr><td>소요 시간</td><td>${(endTime - startTime).toFixed(2)}ms</td></tr>
+                            </table>
+                            <button onclick="downloadTestResult('${testCase.path}', '${testCase.expectedType}')" style="margin-top: 10px; padding: 8px 16px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                                결과 PDF 다운로드
+                            </button>
+                        `;
+                    } else {
+                        caseDiv.innerHTML = `<h3>${testCase.name} <span class="error">[FAIL - Anchor Not Found]</span></h3>`;
+                    }
+                } catch (err) {
+                    caseDiv.innerHTML = `<h3>${testCase.name} <span class="error">[ERROR]</span></h3><pre>${err.message}</pre>`;
+                }
+            }
+        }
+
+        async function downloadTestResult(pdfPath, type) {
+            try {
+                const pdfResp = await fetch(pdfPath);
+                const pdfBytes = new Uint8Array(await pdfResp.arrayBuffer());
+
+                const signResp = await fetch('samples/sign.png');
+                const signBytes = new Uint8Array(await signResp.arrayBuffer());
+
+                const anchor = await findAgentAnchor(pdfBytes);
+                const pdfDoc = await PDFLib.PDFDocument.load(pdfBytes);
+                const image = await pdfDoc.embedPng(signBytes);
+
+                const signWidth = 120;
+                const signHeight = (image.height / image.width) * signWidth;
+
+                let pageIndex = pdfDoc.getPageCount() - 1;
+                let x = 420, y = 72;
+
+                if (anchor) {
+                    pageIndex = anchor.pageIndex;
+                    x = anchor.x + anchor.width / 2 - signWidth / 2;
+                    y = anchor.y + 5 - signHeight / 2;
+                }
+
+                const page = pdfDoc.getPage(pageIndex);
+                page.drawImage(image, { x, y, width: signWidth, height: signHeight });
+
+                const output = await pdfDoc.save();
+                const blob = new Blob([output], { type: 'application/pdf' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `TEST_${type}_RESULT.pdf`;
+                link.click();
+            } catch (err) {
+                alert(`다운로드 실패: ${err.message}`);
+            }
+        }
+
+        window.onload = runTests;
+    </script>
+</body>
+
+</html>
